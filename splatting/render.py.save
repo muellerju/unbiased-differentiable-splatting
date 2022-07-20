@@ -1,0 +1,424 @@
+import torch
+import torch.nn as nn
+
+from pytorch3d.renderer import (
+        get_ndc_to_screen_transform,
+
+    get_ndc_to_screen_transform,
+)
+from pytorch3d.renderer import (
+    PointsRasterizer,
+    PointFragments
+)
+
+from pytorch.structure import (
+    Pointclouds
+)
+
+from typing import Any, Tuple
+import math
+
+import matplotlib.pyplot as plt
+
+from .shading import *
+from .sampling import *
+from .extensions import PixelScatterGather, FmmSampling, EWASplatting, DepthFiltering, DiffuseShading, AffineTransform, LinearTransform, LinearInterpolation
+from .depthfilter import *
+from .extensions.utils import *
+
+from cudaExtensions import sampling as cudaSampling
+
+def _transformToObjectspace(screenPoints : torch.Tensor) -> torch.Tensor:
+    if len(screenPoints.shape) == 5:
+        screenSize = self.screenSize.view(1, 1, 1, 1, 2) # bn, w, h, n, c
+    else:
+        screenSize = self.screenSize.view(1, 1, 2) # bn, n, c
+    scale = self.scale.view_as(screenSize)
+
+    shape = list(screenPoints.shape)
+    shape[-1] += 1
+
+    objectPoint = torch.ones(size=shape, dtype=self.dtype, device=self.device)
+    objectPoint[...,:2] = (screenSize - 2.0*screenPoints)/(2.0*scale)
+    return objectPoint
+
+def _buildCovariance(invJk : torch.Tensor, pointStdDevs : torch.Tensor) -> torch.Tensor:
+    Jk = _inverse22(invJk)
+    eye = self.smoothing * torch.eye(2, dtype=self.dtype, device=self.device)
+    Vrk = _diag22(pointStdDevs.square())
+    if len(invJk.shape) == 6:
+        eye = eye.view(1, 1, 1, 1, 2, 2) # bn, w, h, m, 2, 2
+        Vk = eye + torch.matmul(Jk, torch.matmul(Vrk, Jk.transpose(4, 5)))
+    else:
+        eye = eye.view(1, 1, 2, 2) # bn, m, 2, 2
+        Vk = eye + torch.matmul(Jk, torch.matmul(Vrk, Jk.transpose(2, 3)))
+    return Vk
+
+def splat_points(
+    pointclouds : Pointclouds,
+    jacboians : torch.Tensor,
+    image_size : int,
+    radius : float,
+    points_per_pixel : int,
+):
+
+    points_packed = pointclouds.points_packed()
+    normals_packed = pointclouds.normals_packed()
+
+    return _ImportanceSplatting.apply(
+        points_packed,
+        normals_packed,
+        jacboians,
+        image_size,
+        radius,
+        points_per_pixel,
+    )
+
+class ProbabilisticSplatting(PointsRasterizer):
+
+    def __init__(self, cameras=None, raster_settings=None) -> None:
+        super().__init__(cameras, raster_settings)
+
+    def buildInverseJacobian(self, point_clouds : Pointclouds, **kwargs) -> torch.Tensor:
+
+        cameras = kwargs.get("cameras", self.cameras)
+        if cameras is None:
+            msg = "Cameras must be specified either at initialization \
+                or in the forward pass of PointsRasterizer"
+            raise ValueError(msg)
+        
+        # Transformation
+        points_world = point_clouds.points_padded()
+        # NOTE: Retaining view space z coordinate for now.
+        # TODO: Remove this line when the convention for the z coordinate in
+        # the rasterizer is decided. i.e. retain z in view space or transform
+        # to a different range.
+        eps = kwargs.get("eps", None)
+        points_view = cameras.get_world_to_view_transform(**kwargs).transform_points(
+            points_world, eps=eps
+        )
+        # view to NDC transform
+        to_ndc_transform = cameras.get_ndc_camera_transform(**kwargs)
+        projection_transform = cameras.get_projection_transform(**kwargs).compose(
+            to_ndc_transform
+        )
+        points_ndc = projection_transform.transform_points(points_view, eps=eps)
+        points_ndc[..., 2] = points_view[..., 2]
+        
+        # NDC to screen transform
+        image_size = kwargs.get("image_size", self.raster_settings)
+        points_screen = get_ndc_to_screen_transform(
+            cameras, with_xyflip=True, image_size=image_size
+        ).transform_points(points_ndc, eps=eps)
+
+        normals_world = point_clouds.normals_padded()
+        normals_view = cameras.get_world_to_view_transform(**kwargs).transform_normals(
+            normals_world
+        )
+        point_clouds = point_clouds.update_padded(points_ndc, normals_view)
+        
+        # Reproject the screen space basis vectors
+        y0 = points_screen.clone()
+        y0[...,0] += 1.0
+        x0 = cameras.unproject_points(y0)
+        y1 = points_screen.clone()
+        y1[...,1] += 1.0
+        x1 = cameras.unproject_points(y1)
+        
+        # Projec onto the tangent plane
+        x0_tilde, _ = projectOntoPlane(x0, points_view, normals_view)
+        x0_tilde -= points_view
+        x1_tilde, _ = projectOntoPlane(x1, points_view, normals_view)
+        x1_tilde -= points_view
+        
+        # Build tangent frame
+        u0 = normalize(x0_tilde)
+        u1 = u0.cross(normals_view)
+        
+        # Construct Jacobian
+        shape = list(points_screen.shape) + [2]
+        invJk = torch.zeros(size=shape, dtype=points_view.dtype, device=points_view.device)
+        invJk[...,0,0] = x0_tilde.norm(dim=-1)
+        invJk[...,0,1] = dot(x1_tilde, u0, keepdim=False)
+        invJk[...,1,1] = dot(x1_tilde, u1, keepdim=False)
+        return point_clouds, invJk
+
+    def forward(self, point_clouds : Pointclouds, **kwargs) -> PointFragments:
+
+        #points_proj = self.transform(point_clouds, **kwargs)
+        points_proj, jacobians = self.buildInverseJacobian(point_clouds)
+        raster_settings = kwargs.get("raster_settings", self.raster_settings)
+        idx, zbuf, dists2 = splat_points(
+            points_proj,
+            jacobians,
+            image_size=raster_settings.image_size,
+            radius=raster_settings.radius,
+            points_per_pixel=raster_settings.points_per_pixel,
+        )
+
+        return PointFragments(idx=idx, zbuf=zbuf, dists=dists2)
+
+
+def _normalizeWeights(weights : torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    print("Weights shape", weights.shape)
+    accumulated = weights.sum(3, keepdim=True)
+    accumulated = torch.where(accumulated < 0.01, torch.ones_like(accumulated), accumulated)
+    nWeights = weights/accumulated
+    return nWeights, accumulated
+
+def _normalizeNormals(normals : torch.Tensor) -> torch.Tensor:
+    norms = normals.norm(dim=-1, keepdim=True)
+    normals = torch.where(norms < 0.01, torch.ones_like(normals), normals)
+    return normalize(normals)
+
+class BackfaceCulling(torch.nn.Module):
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, normals, camNormals):
+
+        normalAngle = camNormals[...,2].unsqueeze(-1)
+        
+        normals = torch.where(normalAngle > 0, -normals, normals)
+        camNormals = torch.where(normalAngle > 0, -camNormals, camNormals)
+
+        return normals, camNormals
+
+class Splatting(torch.nn.Module):
+
+    def __init__(self, opts, logger, width : int, height : int, focallength : float, zmin : float, zmax : float, smoothing : float) -> None:
+        super().__init__()
+        self.logger = logger
+        
+        # Intrinsic camera parameter
+        self.width = width
+        self.height = height
+        self.focallength = focallength
+
+        # Coordinate system parameter
+        self.coordForward = opts.forward
+
+        # Rendering parameters
+        self.smoothing = smoothing
+        self.numSamples = opts.numSamples
+        self.precision = opts.precision
+        self.shadingMode = opts.shadingMode
+        
+        # Technical parameter
+        self.dtype = opts.dtype
+        self.device = opts.device
+
+        # Intermediate modules and autograd functions
+        self.affineTransform = AffineTransform.apply
+        self.linearTransform = LinearTransform.apply
+        self.backface = BackfaceCulling()
+        self.sampling = FmmSampling()
+        self.ewa = EWASplatting.apply
+        self.depthBlending = DepthFiltering.apply
+        self.linearInterpolation = LinearInterpolation.apply
+        self.deferredShading = DiffuseShading.apply
+        self.alphaGather = PixelScatterGather.apply
+        self.forwardShading = Lambert()
+        self.sphericalHarmonics = DeferredSphericalHaromic()
+        self.forwardHarmonics = ForwardSphericalHaromic()
+
+    def forward(self,
+        camPositions : torch.Tensor, camOrientations : torch.Tensor, 
+        pointPositions : torch.Tensor, pointNormals : torch.Tensor, pointStdDevs : torch.Tensor, pointDiffuse : torch.Tensor, 
+        ambientLight : torch.Tensor, lampDirections : torch.Tensor, lampIntensities : torch.Tensor,
+        alpha : torch.Tensor = None) -> torch.Tensor:
+
+        bn = camPositions.shape[0]
+        _, n, _ = pointPositions.shape
+        #if camPositions.dim() == 3:
+        #    transformMatrix = camPositions.contiguous()
+        #else:
+        transformMatrix = world2Camera(camPositions, camOrientations) #.squeeze(1)
+        #transformMatrix = torch.linalg.inv(transformMatrix.squeeze(1)).unsqueeze(1)
+        transformMatrix = transformForward(transformMatrix, self.coordForward).squeeze(1)
+
+        # Transform point positions and normals into camera space
+        camPoints = self.affineTransform(transformMatrix, pointPositions)
+        camNormals = self.linearTransform(transformMatrix, pointNormals)
+
+        # Orient all normals to face the camera
+        pointNormals, backfaceNormals = self.backface(pointNormals, camNormals)
+
+        # Perform per pixel importance sampling
+        with torch.no_grad():
+            indices = self.sampling(
+                self.width, self.height, self.focallength,
+                camPoints, backfaceNormals, pointDiffuse, pointStdDevs,
+                self.numSamples, self.smoothing, self.precision)
+            self.indices = indices.cpu().clone()
+
+        # Compute screen space weights
+        ewaWeights = self.ewa(
+            self.width, self.height, self.focallength,
+            indices, camPoints, camNormals, pointStdDevs,
+            self.smoothing)
+
+        # Compute weights
+        #if alpha is not None:
+        #    print(alpha.shape)
+        #    perPixelAlpha = self.alphaGather(indices, alpha)
+        #    print(ewaWeights.shape, perPixelAlpha.shape)
+        #    ewaWeights = ewaWeights*perPixelAlpha[...,0]
+        #    print(ewaWeights.shape)
+
+        # Perform the depth filtering step
+        depthWeights = self.depthBlending(
+            indices, ewaWeights,
+            self.width, self.height, self.focallength,
+            camPoints, camNormals)
+
+        # Transform light directions into camera space
+        camLampDirections = self.linearTransform(transformMatrix, lampDirections)
+
+        # Evluate shading model
+        if self.shadingMode == "deferred":
+
+            # Interpolate attribute of sampled points with depth filtered ewa weights
+            ewaNormals = _normalizeNormals(self.linearInterpolation(indices, depthWeights, camNormals))
+            #print("ewaNormals", ewaNormals.shape, ewaNormals.min(), ewaNormals.max())
+            ewaDiffuse = self.linearInterpolation(indices, depthWeights, pointDiffuse)
+            #print("ewaDiffuse", ewaDiffuse.shape, ewaDiffuse.min(), ewaDiffuse.max())
+
+            # Store filtered attribute functions
+            self.logger.logNormals(ewaNormals, "normals")
+            self.logger.logImages(ewaDiffuse, [0, 1], "diffuse")
+
+            image = self.deferredShading(ambientLight, camLampDirections, lampIntensities, ewaNormals, ewaDiffuse)
+
+        elif self.shadingMode == "forward":
+
+            shadedPoints = self.forwardShading(ambientLight, camLampDirections, lampIntensities, camNormals, pointDiffuse)
+            image = self.linearInterpolation(indices, depthWeights, shadedPoints)
+
+        elif self.shadingMode == "sphericalHarmonics":
+
+            # Interpolate attribute of sampled points with depth filtered ewa weights
+            ewaNormals = self.linearInterpolation(indices, depthWeights, pointNormals)
+            #print("ewaNormals", ewaNormals.shape, ewaNormals.min(), ewaNormals.max())
+            ewaDiffuse = self.linearInterpolation(indices, depthWeights, pointDiffuse)
+            #print("ewaDiffuse", ewaDiffuse.shape, ewaDiffuse.min(), ewaDiffuse.max())
+
+            # Store filtered attribute functions
+            #self.logger.logNormals(ewaNormals, "normals")
+            #self.logger.logImages(ewaDiffuse, [0, 1], "diffuse")
+
+            image = self.sphericalHarmonics(ewaNormals, ewaDiffuse)
+
+        elif self.shadingMode == "forwardHarmonics":
+
+            shadedPoints = self.forwardHarmonics(pointNormals, pointDiffuse)
+            image = self.linearInterpolation(indices, depthWeights, shadedPoints)
+
+        elif self.shadingMode == "None":
+
+            image = self.linearInterpolation(indices, depthWeights, pointDiffuse)
+
+        elif self.shadingMode == "silhouette":
+
+            image = torch.sum(ewaWeights, dim=-1, keepdim=True)
+            image = torch.clamp(image, 0, 1)
+
+        else:
+            raise ValueError("Unkown shading mode")
+
+        #listAllocatedTensors()
+
+        # Evalute the shading model per pixel
+        #print("image", image.shape, image.min(), image.max())
+        return image, indices, depthWeights
+
+    def computeCovariance(self, camPositions : torch.Tensor, camOrientations : torch.Tensor, pointPositions : torch.Tensor, pointNormals : torch.Tensor, pointColors : torch.Tensor, pointStdDevs : torch.Tensor):
+        bn, _ = camPositions.shape
+        _, n, _ = pointPositions.shape
+        transformMatrix = world2Camera(camPositions, camOrientations).squeeze(1)
+
+        # Transform point positions and normals into camera space
+        camPoints = self.affineTransform(transformMatrix, pointPositions)
+        camNormals = self.linearTransform(transformMatrix, pointNormals)
+
+        # Orient all normals to face the camera
+        pointNormals, camNormals = self.backface(pointNormals, camNormals)
+
+        # Compute current covariance matrices
+        covariances = cudaSampling.covariance(
+            self.width, self.height, self.focallength, 
+            camPoints, camNormals, pointStdDevs, 
+            self.smoothing
+        )
+
+        return camPoints, covariances
+
+    def computeFMMWeights(self, camPositions : torch.Tensor, camOrientations : torch.Tensor, pointPositions : torch.Tensor, pointNormals : torch.Tensor, pointColors : torch.Tensor, pointStdDevs : torch.Tensor):
+        bn, _ = camPositions.shape
+        _, n, _ = pointPositions.shape
+        transformMatrix = world2Camera(camPositions, camOrientations, self.coordForward).squeeze(1)
+
+        # Transform point positions and normals into camera space
+        camPoints = self.affineTransform(transformMatrix, pointPositions)
+        camNormals = self.linearTransform(transformMatrix, pointNormals)
+
+        # Orient all normals to face the camera
+        pointNormals, camNormals = self.backface(pointNormals, camNormals)
+
+        fmmWeights = sampling.approximateFMMWeights(
+            self.width, self.height, self.focallength,
+            camPoints, camNormals, pointColors, pointStdDevs,
+            self.smoothing, self.precision
+        )
+
+        return fmmWeights
+
+if __name__ == "__main__":
+
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+
+    points = torch.normal(0.0, 1.0, size=[1,100,3])
+    points = normalize(points)
+    normals = points.detach().clone()
+    stdDevs = 0.0001*torch.ones([1,100,2])
+
+    camPosition = torch.FloatTensor([0.0, 0.0, 2.0]).unsqueeze(0)
+    camOrientations = torch.FloatTensor([1.0, 0.0, 0.0, 0.0]).unsqueeze(0)
+
+    red = torch.FloatTensor([1.0, 0.0, 0.0]).view(1,1,3)
+    blue = torch.FloatTensor([0.0, 0.0, 1.0]).view(1,1,3)
+    interploate = 0.5*(points[...,2].unsqueeze(-1)+1) 
+    diffuse = (1-interploate)*red + interploate*blue#torch.ones(size=[1,100,3])
+    lampIntensities = torch.ones(size=[1,10,3])
+    lampDirections = normalize(torch.normal(0.0, 1.0, size=(1,10,3)))
+
+    fov = matorch.pi/2
+    renderer = Splatting(128, 128, fov, 0.1, 50.0) #EWAWeight(128, 128, matorch.pi/2, 0.1, 50.0)
+    image, camPoints, camNormals, pixelWeights, pixelDiffuse, pixelNormals = renderer(camPosition, camOrientations, points, normals, stdDevs, diffuse, lampDirections, lampIntensities)
+
+    fig = plt.figure(0)
+    ax = fig.add_subplot(111, projection='3d')
+    for point, color in zip(points[0], diffuse[0]):
+        ax.scatter(point[0], point[1], point[2], c=[color.numpy()])
+    #ax = fig.add_subplot(122)
+    #ax.scatter(screen[:,0], screen[:,1])
+    #ax.set_xlim(0, 128)
+    #ax.set_ylim(0, 128)
+
+    fig = plt.figure(1)
+    ax = fig.add_subplot(221)
+    ax.set_title("EWA Weights")
+    ax.imshow(pixelWeights.sum(1).squeeze())
+    ax = fig.add_subplot(222)
+    ax.set_title("Diffuse")
+    ax.imshow(pixelDiffuse.squeeze())
+    ax = fig.add_subplot(223)
+    ax.set_title("Normal")
+    ax.imshow(pixelNormals.squeeze())
+
+    fig = plt.figure(2)
+    plt.imshow(image.squeeze())
+
+    plt.show()
